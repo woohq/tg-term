@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tg-term: Remote terminal via Telegram -> WezTerm.
 
-Send messages from your phone to control terminal sessions on your Mac.
+Send messages from your phone to control terminal sessions remotely.
 """
 
 import os
@@ -103,6 +103,17 @@ def wez_get(pane_id: int) -> str:
 def wez_kill(pane_id: int):
     wez("kill-pane", "--pane-id", str(pane_id))
 
+def wez_list_panes() -> list[dict]:
+    """List all WezTerm panes as [{pane_id, tab_id, title, cwd}, ...]."""
+    import json as _json
+    raw = wez("list", "--format", "json")
+    if not raw:
+        return []
+    try:
+        return _json.loads(raw)
+    except _json.JSONDecodeError:
+        return []
+
 # ---------------------------------------------------------------------------
 # Session state
 # ---------------------------------------------------------------------------
@@ -197,7 +208,9 @@ HELP = """Remote Terminal via Telegram
 Commands:
   (any text) - execute as shell command
   /new [name] - create terminal session
-  /list - list sessions
+  /attach <id> [name] - attach existing pane
+  /panes - show all WezTerm panes
+  /list - list tracked sessions
   /switch <id> - switch active session
   /screen - capture current screen
   /kill <id> - kill session
@@ -211,15 +224,47 @@ def cmd_new(chat_id, args):
     pid, name = create_session(chat_id, args.strip() or None)
     return f"Session '{name}' created (pane {pid})"
 
+def cmd_attach(chat_id, args):
+    parts = args.strip().split(maxsplit=1)
+    if not parts:
+        return "Usage: /attach <pane_id> [name]"
+    try:
+        pid = int(parts[0])
+    except ValueError:
+        return "Usage: /attach <pane_id> [name]"
+    s = st(chat_id)
+    if pid in s["sessions"]:
+        return f"Pane {pid} already tracked."
+    name = parts[1] if len(parts) > 1 else f"attached-{pid}"
+    s["sessions"][pid] = {"name": name, "prev": ""}
+    s["active"] = pid
+    return f"Attached to pane {pid} as '{name}'"
+
+def cmd_panes(_chat_id, _args):
+    panes = wez_list_panes()
+    if not panes:
+        return "No WezTerm panes found."
+    lines = []
+    for p in panes:
+        pid = p.get("pane_id", "?")
+        title = p.get("title", "")
+        cwd = p.get("cwd", "")
+        # shorten cwd for display
+        if cwd:
+            cwd = cwd.replace("file://", "").split("/")[-2:]
+            cwd = "/".join(cwd)
+        lines.append(f"  [{pid}] {title}  ({cwd})")
+    return "All WezTerm panes:\n" + "\n".join(lines)
+
 def cmd_list(chat_id, _args):
     s = state.get(chat_id)
     if not s or not s["sessions"]:
-        return "No sessions. Use /new to create one."
+        return "No tracked sessions. Use /new or /attach."
     lines = []
     for pid, info in s["sessions"].items():
         marker = " *" if pid == s["active"] else ""
         lines.append(f"  [{pid}] {info['name']}{marker}")
-    return "Sessions:\n" + "\n".join(lines)
+    return "Tracked sessions:\n" + "\n".join(lines)
 
 def cmd_switch(chat_id, args):
     s = state.get(chat_id)
@@ -310,6 +355,8 @@ COMMANDS = {
     "/start": lambda c, a: HELP,
     "/help": lambda c, a: HELP,
     "/new": cmd_new,
+    "/attach": cmd_attach,
+    "/panes": cmd_panes,
     "/list": cmd_list,
     "/switch": cmd_switch,
     "/kill": cmd_kill,
