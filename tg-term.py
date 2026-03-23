@@ -19,6 +19,10 @@ import sys
 import time
 from pathlib import Path
 
+# Force unbuffered stdout so logs appear immediately
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
+
 import requests
 
 # ---------------------------------------------------------------------------
@@ -231,7 +235,7 @@ def dm_create(chat_id: int, name: str | None = None) -> tuple[int, str]:
     s = dm_st(chat_id)
     name = name or f"tg-{len(s['sessions'])}"
     pid = wez_spawn(name)
-    s["sessions"][pid] = {"name": name, "prev": ""}
+    s["sessions"][pid] = {"pane_id": pid, "name": name, "prev": ""}
     s["active"] = pid
     return pid, name
 
@@ -461,7 +465,7 @@ def dcmd_attach(ctx: Ctx, args: str) -> str:
     if pid in s["sessions"]:
         return f"Pane {pid} already tracked."
     name = parts[1] if len(parts) > 1 else f"attached-{pid}"
-    s["sessions"][pid] = {"name": name, "prev": ""}
+    s["sessions"][pid] = {"pane_id": pid, "name": name, "prev": ""}
     s["active"] = pid
     return f"Attached to pane {pid} as '{name}'"
 
@@ -662,7 +666,7 @@ def main():
             is_forum = (FORUM_GROUP_ID is not None and chat_id == FORUM_GROUP_ID)
 
             ctx = Ctx(chat_id, user_id, thread_id, is_forum)
-            print(f"  [{user_id}] {'T' + str(thread_id) + ' ' if thread_id else ''}{text[:80]}")
+            print(f"  chat={chat_id} user={user_id}{' thread=' + str(thread_id) if thread_id else ''} | {text[:80]}")
             try:
                 handle(ctx, text)
             except Exception as e:
