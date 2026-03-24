@@ -322,20 +322,31 @@ def pane_monitor():
                 known_pids = set(pane_to_thread.keys())
 
                 # New panes — create topics
+                # Count existing dir names for dedup numbering
+                used_names: dict[str, int] = {}
+                for s in forum_sessions.values():
+                    base = s["name"]
+                    used_names[base] = used_names.get(base, 0) + 1
+
                 for pid in current_pids - known_pids:
                     info = pane_info[pid]
-                    title = info.get("title", "").strip() or f"pane-{pid}"
                     cwd = info.get("cwd", "")
                     if cwd:
-                        # Extract last dir component for a shorter name
-                        cwd_short = cwd.replace("file://", "").rstrip("/").split("/")[-1]
-                        if cwd_short and cwd_short != title:
-                            title = f"{title} ({cwd_short})"
-                    topic_name = f"[{MACHINE_NAME}] {title}"
+                        dirname = cwd.replace("file://", "").rstrip("/").split("/")[-1]
+                    else:
+                        dirname = f"pane-{pid}"
+                    # Deduplicate: if name already used, add (2), (3), etc.
+                    base = dirname
+                    count = used_names.get(base, 0)
+                    if count > 0:
+                        dirname = f"{base} ({count + 1})"
+                    used_names[base] = count + 1
+
+                    topic_name = f"[{MACHINE_NAME}] {dirname}"
                     tid = create_topic(topic_name)
                     if tid:
-                        forum_register(tid, pid, title)
-                        print(f"  monitor: new pane {pid} -> topic '{topic_name}'")
+                        forum_register(tid, pid, base)
+                        print(f"  monitor: pane {pid} -> '{topic_name}'")
 
                 # Closed panes — close topics
                 for pid in known_pids - current_pids:
