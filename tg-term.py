@@ -380,6 +380,37 @@ def pane_monitor():
                     forum_unregister_pane(pid)
                     print(f"  monitor: pane {pid} closed -> topic '{name}' closed")
 
+            # Watch for local output changes on all tracked panes
+            for tid, sess in list(forum_sessions.items()):
+                try:
+                    current = wez_get(sess["pane_id"])
+                    prev = sess["prev"]
+                    if not prev:
+                        # First capture — just save, don't spam the full screen
+                        sess["prev"] = current
+                        continue
+                    if current == prev:
+                        continue
+                    # Output changed — compute diff and push to Telegram
+                    sess["prev"] = current
+                    prev_lines = prev.splitlines()
+                    cur_lines = current.splitlines()
+                    anchor_size = min(5, len(prev_lines))
+                    anchor = prev_lines[-anchor_size:] if anchor_size else []
+                    new_lines = cur_lines
+                    if anchor:
+                        for i in range(len(cur_lines) - anchor_size, -1, -1):
+                            if cur_lines[i:i + anchor_size] == anchor:
+                                new_lines = cur_lines[i + anchor_size:]
+                                break
+                    new_lines = [l for l in new_lines if l.strip()]
+                    if new_lines:
+                        text = truncate("\n".join(new_lines))
+                        if text and text != "(no new output)":
+                            reply(FORUM_GROUP_ID, text, tid)
+                except Exception:
+                    pass
+
         except Exception as e:
             print(f"  monitor error: {e}")
 
