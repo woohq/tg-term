@@ -42,6 +42,7 @@ def reset_state():
     """Clear all mutable global state before each test."""
     tg_term.forum_sessions.clear()
     tg_term.dm_state.clear()
+    tg_term.pane_to_thread.clear()
     tg_term._color_idx = 0
     # Reset module-level config to test defaults
     tg_term.ALLOWED_USER_IDS = set()
@@ -467,9 +468,7 @@ class TestForumCommands:
 
     def test_merge_moves_pane(self, mock_helpers):
         tg_term.FORUM_GROUP_ID = -100
-        # Source topic has pane 42
-        tg_term.forum_sessions[10] = {"pane_id": 42, "name": "source", "prev": ""}
-        # Target topic (50) is empty
+        tg_term.forum_register(10, 42, "source")
         ctx = make_forum_ctx(thread_id=50)
         result = tg_term.fcmd_merge(ctx, "42")
         assert "Merged" in result
@@ -478,8 +477,8 @@ class TestForumCommands:
 
     def test_merge_replaces_existing(self, mock_helpers):
         tg_term.FORUM_GROUP_ID = -100
-        tg_term.forum_sessions[10] = {"pane_id": 42, "name": "source", "prev": ""}
-        tg_term.forum_sessions[50] = {"pane_id": 99, "name": "old", "prev": ""}
+        tg_term.forum_register(10, 42, "source")
+        tg_term.forum_register(50, 99, "old")
         ctx = make_forum_ctx(thread_id=50)
         result = tg_term.fcmd_merge(ctx, "42")
         assert "Merged" in result
@@ -818,3 +817,99 @@ class TestSharedCommands:
         with patch.object(tg_term.requests, "post", side_effect=tg_term.requests.RequestException):
             results = tg_term.poll(None)
             assert results == []
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# H. Pane Monitor & Reverse Mapping
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestPaneMonitor:
+
+    def test_forum_register_creates_reverse_mapping(self, mock_helpers):
+        tg_term.forum_register(100, 42, "test")
+        assert tg_term.pane_to_thread[42] == 100
+        assert tg_term.forum_sessions[100]["pane_id"] == 42
+
+    def test_forum_unregister_removes_both(self, mock_helpers):
+        tg_term.forum_register(100, 42, "test")
+        tg_term.forum_unregister_pane(42)
+        assert 42 not in tg_term.pane_to_thread
+        assert 100 not in tg_term.forum_sessions
+
+    def test_forum_create_registers_both(self, mock_helpers):
+        tg_term.FORUM_GROUP_ID = -100
+        tid, pid, name = tg_term.forum_create("test")
+        assert pid in tg_term.pane_to_thread
+        assert tg_term.pane_to_thread[pid] == tid
+
+    def test_fcmd_kill_cleans_reverse_mapping(self, mock_helpers):
+        tg_term.FORUM_GROUP_ID = -100
+        tid, pid, _ = tg_term.forum_create("test")
+        ctx = make_forum_ctx(thread_id=tid)
+        tg_term.fcmd_kill(ctx, "")
+        assert pid not in tg_term.pane_to_thread
+        assert tid not in tg_term.forum_sessions
+
+    def test_fcmd_merge_updates_reverse_mapping(self, mock_helpers):
+        tg_term.FORUM_GROUP_ID = -100
+        tg_term.forum_register(10, 42, "source")
+        ctx = make_forum_ctx(thread_id=50)
+        tg_term.fcmd_merge(ctx, "42")
+        assert tg_term.pane_to_thread[42] == 50
+        assert 10 not in tg_term.forum_sessions
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# I. Command Echo Stripping
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestCommandStripping:
+
+    def test_capture_strips_echoed_command(self, mock_helpers):
+        """Output should NOT contain the command the user typed."""
+        sess = {"pane_id": 1, "name": "t", "prev": ""}
+        # First capture (prev empty) with command echo in output
+        with patch.object(tg_term, "wez_get", return_value="$ echo hello\nhello\n$ "):
+            result = tg_term._capture(sess, cmd_text="echo hello")
+            assert "hello" in result
+            assert "echo hello" not in result
+
+    def test_capture_without_cmd_text_keeps_all(self, mock_helpers):
+        sess = {"pane_id": 1, "name": "t", "prev": ""}
+        with patch.object(tg_term, "wez_get", return_value="$ echo hello\nhello\n$ "):
+            result = tg_term._capture(sess, cmd_text=None)
+            assert "echo hello" in result
+
+    def test_dcmd_exec_strips_echo(self, mock_helpers):
+        """End-to-end: DM exec should not echo the command."""
+        ctx = make_dm_ctx()
+        tg_term.dcmd_new(ctx, "test")
+        pid = tg_term.dm_state[100]["active"]
+        sess = tg_term.dm_state[100]["sessions"][pid]
+        # Simulate first command (prev empty, so full output returned)
+        sess["prev"] = ""
+        with patch.object(tg_term, "wez_get", return_value="$ ls\nfile.txt\ndir/\n$ "):
+            result = tg_term.dcmd_exec(ctx, "ls")
+            assert "file.txt" in result
+            assert "$ ls" not in result
+
+    def test_fcmd_exec_strips_echo(self, mock_helpers):
+        """End-to-end: Forum exec should not echo the command."""
+        tg_term.FORUM_GROUP_ID = -100
+        tid, pid, _ = tg_term.forum_create("test")
+        sess = tg_term.forum_sessions[tid]
+        sess["prev"] = ""
+        ctx = make_forum_ctx(thread_id=tid)
+        with patch.object(tg_term, "wez_get", return_value="$ pwd\n/home/user\n$ "):
+            result = tg_term.fcmd_exec(ctx, "pwd")
+            assert "/home/user" in result
+            assert "$ pwd" not in result
+
+    def test_stripping_only_removes_matching_lines(self, mock_helpers):
+        """Lines that don't contain the command should be preserved."""
+        sess = {"pane_id": 1, "name": "t", "prev": ""}
+        with patch.object(tg_term, "wez_get", return_value="$ git status\nOn branch main\nnothing to commit\n$ "):
+            result = tg_term._capture(sess, cmd_text="git status")
+            assert "On branch main" in result
+            assert "nothing to commit" in result
+            assert "git status" not in result

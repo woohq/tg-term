@@ -3,12 +3,12 @@
 
 Send messages from your phone to control terminal sessions remotely.
 
-Two modes:
-  - Forum mode: create a Telegram group with Topics enabled, add the bot.
-    Each /new creates a topic thread AND a WezTerm pane. Messages in a
-    topic go to that pane automatically.
-  - DM mode (fallback): chat directly with the bot. Multiple sessions in
-    one chat, use /switch to change active pane.
+Forum mode (primary): Create a Telegram group with Topics enabled, add the
+bot as admin. The bot auto-detects all WezTerm panes and creates a topic
+for each one. New panes get topics automatically; closed panes get their
+topics closed.
+
+DM mode (fallback): Chat directly with the bot when no group is configured.
 """
 
 import json as _json
@@ -16,6 +16,7 @@ import os
 import platform
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -49,21 +50,19 @@ _raw = os.environ.get("ALLOWED_USER_IDS", "")
 if _raw:
     ALLOWED_USER_IDS = {int(x.strip()) for x in _raw.split(",") if x.strip()}
 
-# Forum mode: set this to the group chat ID (negative number) to enable
 FORUM_GROUP_ID: int | None = None
 _fg = os.environ.get("TELEGRAM_GROUP_ID", "")
 if _fg:
     FORUM_GROUP_ID = int(_fg)
 
-# Machine name for topic grouping — topics are named "[MACHINE] session-name"
 MACHINE_NAME = os.environ.get("MACHINE_NAME", "") or platform.node().split(".")[0]
 
 MAX_LINES = 50
-MAX_CHARS = 4000          # Telegram limit is 4096; leave room for wrapper
-CAPTURE_DELAY = 1.5       # seconds to wait after sending a command
-POLL_TIMEOUT = 30         # long-poll timeout in seconds
+MAX_CHARS = 4000
+CAPTURE_DELAY = 1.5
+POLL_TIMEOUT = 30
+MONITOR_INTERVAL = 3  # seconds between pane scans
 
-# Topic icon colors (Telegram-supported values)
 TOPIC_COLORS = [0x6FB9F0, 0xFFD67E, 0xCB86DB, 0x8EEE98, 0xFF93B2, 0xFB6F5F]
 _color_idx = 0
 
@@ -94,7 +93,10 @@ def reply(chat_id: int, text: str, thread_id: int | None = None):
         tg("sendMessage", **kwargs)
 
 def poll(offset: int | None):
-    params: dict = {"timeout": POLL_TIMEOUT, "allowed_updates": ["message"]}
+    params: dict = {
+        "timeout": POLL_TIMEOUT,
+        "allowed_updates": ["message", "my_chat_member"],
+    }
     if offset is not None:
         params["offset"] = offset
     try:
@@ -106,7 +108,6 @@ def poll(offset: int | None):
         return []
 
 def create_topic(name: str) -> int | None:
-    """Create a forum topic in the configured group. Returns thread_id."""
     if not FORUM_GROUP_ID:
         return None
     resp = tg("createForumTopic",
@@ -164,11 +165,10 @@ def wez_list_panes() -> list[dict]:
         return []
 
 # ---------------------------------------------------------------------------
-# Context object — unifies forum and DM routing
+# Context object
 # ---------------------------------------------------------------------------
 
 class Ctx:
-    """Routing context for a single message."""
     __slots__ = ("chat_id", "user_id", "thread_id", "forum")
 
     def __init__(self, chat_id: int, user_id: int, thread_id: int | None, forum: bool):
@@ -182,40 +182,56 @@ class Ctx:
 
     @property
     def session_key(self) -> int:
-        """In forum mode, thread_id identifies the session. In DM mode, chat_id."""
         return self.thread_id if (self.forum and self.thread_id) else self.chat_id
 
 # ---------------------------------------------------------------------------
 # Session state
 # ---------------------------------------------------------------------------
 
-# Forum mode: { thread_id: {"pane_id": int, "name": str, "prev": str} }
-# DM mode:    { chat_id: {"active": pane_id, "sessions": {pane_id: {"name","prev"}}} }
+# Forum: thread_id -> {"pane_id": int, "name": str, "machine": str, "prev": str}
 forum_sessions: dict[int, dict] = {}
+# Reverse: pane_id -> thread_id (for monitor to find topics when panes close)
+pane_to_thread: dict[int, int] = {}
+# DM: chat_id -> {"active": pane_id, "sessions": {pane_id: {...}}}
 dm_state: dict[int, dict] = {}
+# Lock for thread-safe state access
+state_lock = threading.Lock()
 
-# --- Forum mode helpers ---
+# --- Forum helpers ---
 
 def forum_get_pane(thread_id: int) -> int | None:
     s = forum_sessions.get(thread_id)
     return s["pane_id"] if s else None
 
+def forum_register(thread_id: int, pane_id: int, name: str):
+    """Register a pane<->topic mapping."""
+    forum_sessions[thread_id] = {
+        "pane_id": pane_id, "name": name, "machine": MACHINE_NAME, "prev": ""
+    }
+    pane_to_thread[pane_id] = thread_id
+
+def forum_unregister_pane(pane_id: int):
+    """Remove a pane and close its topic."""
+    tid = pane_to_thread.pop(pane_id, None)
+    if tid and tid in forum_sessions:
+        del forum_sessions[tid]
+        close_topic(tid)
+
 def forum_create(name: str) -> tuple[int, int, str]:
-    """Create topic + pane. Returns (thread_id, pane_id, name).
-    Topic is named "[MACHINE] name" for visual grouping by machine."""
+    """Create topic + pane. Returns (thread_id, pane_id, name)."""
     topic_name = f"[{MACHINE_NAME}] {name}"
     thread_id = create_topic(topic_name)
     if thread_id is None:
         raise RuntimeError("Failed to create topic. Is the bot a group admin with topic permissions?")
     pane_id = wez_spawn(name)
-    forum_sessions[thread_id] = {"pane_id": pane_id, "name": name, "machine": MACHINE_NAME, "prev": ""}
+    forum_register(thread_id, pane_id, name)
     return thread_id, pane_id, name
 
-def forum_capture(thread_id: int) -> str:
+def forum_capture(thread_id: int, cmd_text: str | None = None) -> str:
     sess = forum_sessions[thread_id]
-    return _capture(sess)
+    return _capture(sess, cmd_text)
 
-# --- DM mode helpers ---
+# --- DM helpers ---
 
 def dm_st(chat_id: int) -> dict:
     if chat_id not in dm_state:
@@ -239,9 +255,9 @@ def dm_create(chat_id: int, name: str | None = None) -> tuple[int, str]:
     s["active"] = pid
     return pid, name
 
-def dm_capture(chat_id: int, pane_id: int) -> str:
+def dm_capture(chat_id: int, pane_id: int, cmd_text: str | None = None) -> str:
     sess = dm_state[chat_id]["sessions"][pane_id]
-    return _capture(sess)
+    return _capture(sess, cmd_text)
 
 # --- Shared capture ---
 
@@ -254,27 +270,84 @@ def truncate(text: str) -> str:
         out = "...(truncated)\n" + out[-MAX_CHARS:]
     return out
 
-def _capture(sess: dict) -> str:
-    """Capture pane text and return new lines since last capture."""
+def _capture(sess: dict, cmd_text: str | None = None) -> str:
+    """Capture pane text and return only new lines since last capture.
+    If cmd_text is provided, strip the echoed command from the output."""
     current = wez_get(sess["pane_id"])
     prev = sess["prev"]
     sess["prev"] = current
 
     if not prev:
-        return truncate(current)
+        new_lines = current.splitlines()
+    else:
+        prev_lines = prev.splitlines()
+        cur_lines = current.splitlines()
+        anchor_size = min(5, len(prev_lines))
+        anchor = prev_lines[-anchor_size:] if anchor_size else []
 
-    prev_lines = prev.splitlines()
-    cur_lines = current.splitlines()
-    anchor_size = min(5, len(prev_lines))
-    anchor = prev_lines[-anchor_size:] if anchor_size else []
+        new_lines = cur_lines  # fallback
+        if anchor:
+            for i in range(len(cur_lines) - anchor_size, -1, -1):
+                if cur_lines[i:i + anchor_size] == anchor:
+                    new_lines = cur_lines[i + anchor_size:]
+                    break
 
-    if anchor:
-        for i in range(len(cur_lines) - anchor_size, -1, -1):
-            if cur_lines[i:i + anchor_size] == anchor:
-                new_lines = cur_lines[i + anchor_size:]
-                return truncate("\n".join(new_lines)) if new_lines else "(no new output)"
+    # Strip the echoed command from output
+    if cmd_text:
+        cmd_stripped = cmd_text.strip()
+        new_lines = [l for l in new_lines if cmd_stripped not in l]
 
-    return truncate(current)
+    if not new_lines:
+        return "(no new output)"
+
+    return truncate("\n".join(new_lines))
+
+# ---------------------------------------------------------------------------
+# Pane monitor (background thread)
+# ---------------------------------------------------------------------------
+
+def pane_monitor():
+    """Auto-detect WezTerm panes and create/close forum topics."""
+    if not FORUM_GROUP_ID:
+        return
+
+    print("  monitor: started")
+    while True:
+        try:
+            panes = wez_list_panes()
+            current_pids = {p["pane_id"] for p in panes}
+            pane_info = {p["pane_id"]: p for p in panes}
+
+            with state_lock:
+                known_pids = set(pane_to_thread.keys())
+
+                # New panes — create topics
+                for pid in current_pids - known_pids:
+                    info = pane_info[pid]
+                    title = info.get("title", "").strip() or f"pane-{pid}"
+                    cwd = info.get("cwd", "")
+                    if cwd:
+                        # Extract last dir component for a shorter name
+                        cwd_short = cwd.replace("file://", "").rstrip("/").split("/")[-1]
+                        if cwd_short and cwd_short != title:
+                            title = f"{title} ({cwd_short})"
+                    topic_name = f"[{MACHINE_NAME}] {title}"
+                    tid = create_topic(topic_name)
+                    if tid:
+                        forum_register(tid, pid, title)
+                        print(f"  monitor: new pane {pid} -> topic '{topic_name}'")
+
+                # Closed panes — close topics
+                for pid in known_pids - current_pids:
+                    tid = pane_to_thread.get(pid)
+                    name = forum_sessions.get(tid, {}).get("name", "?") if tid else "?"
+                    forum_unregister_pane(pid)
+                    print(f"  monitor: pane {pid} closed -> topic '{name}' closed")
+
+        except Exception as e:
+            print(f"  monitor error: {e}")
+
+        time.sleep(MONITOR_INTERVAL)
 
 # ---------------------------------------------------------------------------
 # Key map
@@ -292,31 +365,32 @@ KEYS = {
 }
 
 # ---------------------------------------------------------------------------
-# Command handlers — each returns a reply string
+# Command handlers
 # ---------------------------------------------------------------------------
 
 HELP_FORUM = """Remote Terminal (Forum Mode)
 
-Messages in a topic go to that topic's pane.
+Panes are auto-detected. Each WezTerm pane gets its own topic.
+Messages in a topic go to that pane. Only output is returned.
 
 Commands:
-  (any text) - execute as shell command
-  /new <name> - create session (new topic + pane)
+  (any text) - type into terminal + press enter
+  /new <name> - create new pane + topic
   /panes - show all WezTerm panes
   /attach <pane_id> - attach existing pane to this topic
   /screen - capture current screen
-  /kill - kill this topic's session
-  /merge <topic_pane_id> - move another pane into this topic
+  /kill - kill this topic's pane
+  /merge <pane_id> - move another pane into this topic
   /key <key> - send key (ctrl+c, enter, up, tab...)
   /keys - list available keys
-  /raw <text> - send text without newline
+  /raw <text> - send text without pressing enter
   /wait <secs> - re-capture after delay
   /help - show this"""
 
 HELP_DM = """Remote Terminal (DM Mode)
 
 Commands:
-  (any text) - execute as shell command
+  (any text) - type into terminal + press enter
   /new [name] - create terminal session
   /attach <id> [name] - attach existing pane
   /panes - show all WezTerm panes
@@ -326,19 +400,20 @@ Commands:
   /kill <id> - kill session
   /key <key> - send key (ctrl+c, enter, up, tab...)
   /keys - list available keys
-  /raw <text> - send text without newline
+  /raw <text> - send text without pressing enter
   /wait <secs> - re-capture after delay
   /help - show this"""
 
-# --- Forum mode commands ---
+# --- Forum commands ---
 
 def fcmd_new(ctx: Ctx, args: str) -> str:
     name = args.strip()
     if not name:
         return "Usage: /new <name>"
-    thread_id, pane_id, name = forum_create(name)
+    with state_lock:
+        thread_id, pane_id, name = forum_create(name)
     reply(ctx.chat_id, f"Session '{name}' created (pane {pane_id})", thread_id)
-    return ""  # already replied in the new topic
+    return ""
 
 def fcmd_exec(ctx: Ctx, text: str) -> str:
     tid = ctx.thread_id
@@ -346,7 +421,7 @@ def fcmd_exec(ctx: Ctx, text: str) -> str:
         return "This topic has no session. Use /attach <pane_id> or create a /new session."
     wez_send(forum_sessions[tid]["pane_id"], text + "\n")
     time.sleep(CAPTURE_DELAY)
-    return forum_capture(tid)
+    return forum_capture(tid, cmd_text=text)
 
 def fcmd_screen(ctx: Ctx, _args: str) -> str:
     tid = ctx.thread_id
@@ -364,10 +439,14 @@ def fcmd_kill(ctx: Ctx, _args: str) -> str:
     tid = ctx.thread_id
     if not tid or tid not in forum_sessions:
         return "No session in this topic."
-    sess = forum_sessions.pop(tid)
-    wez_kill(sess["pane_id"])
+    sess = forum_sessions[tid]
+    pid = sess["pane_id"]
+    with state_lock:
+        pane_to_thread.pop(pid, None)
+        forum_sessions.pop(tid, None)
+    wez_kill(pid)
     close_topic(tid)
-    return f"Killed '{sess['name']}' (pane {sess['pane_id']})"
+    return f"Killed '{sess['name']}' (pane {pid})"
 
 def fcmd_attach(ctx: Ctx, args: str) -> str:
     tid = ctx.thread_id
@@ -379,11 +458,11 @@ def fcmd_attach(ctx: Ctx, args: str) -> str:
         return "Usage: /attach <pane_id>"
     if tid in forum_sessions:
         return f"This topic already has pane {forum_sessions[tid]['pane_id']}."
-    forum_sessions[tid] = {"pane_id": pane_id, "name": f"attached-{pane_id}", "prev": ""}
+    with state_lock:
+        forum_register(tid, pane_id, f"attached-{pane_id}")
     return f"Attached pane {pane_id} to this topic."
 
 def fcmd_merge(ctx: Ctx, args: str) -> str:
-    """Move another topic's pane into this topic."""
     tid = ctx.thread_id
     if not tid:
         return "Use this inside a topic."
@@ -391,21 +470,20 @@ def fcmd_merge(ctx: Ctx, args: str) -> str:
         source_pane = int(args.strip())
     except (ValueError, AttributeError):
         return "Usage: /merge <pane_id>"
-    # find which topic owns this pane
-    source_tid = None
-    for t, s in forum_sessions.items():
-        if s["pane_id"] == source_pane:
-            source_tid = t
-            break
+    source_tid = pane_to_thread.get(source_pane)
     if source_tid is None:
         return f"Pane {source_pane} not found in any topic. Use /attach instead."
-    sess = forum_sessions.pop(source_tid)
-    close_topic(source_tid)
-    if tid in forum_sessions:
-        # this topic already has a pane — kill it and replace
-        old = forum_sessions[tid]
-        wez_kill(old["pane_id"])
-    forum_sessions[tid] = sess
+    with state_lock:
+        sess = forum_sessions.pop(source_tid, None)
+        pane_to_thread.pop(source_pane, None)
+        if not sess:
+            return f"Pane {source_pane} session not found."
+        close_topic(source_tid)
+        if tid in forum_sessions:
+            old = forum_sessions[tid]
+            wez_kill(old["pane_id"])
+            pane_to_thread.pop(old["pane_id"], None)
+        forum_register(tid, source_pane, sess["name"])
     return f"Merged pane {source_pane} ('{sess['name']}') into this topic."
 
 def fcmd_key(ctx: Ctx, args: str) -> str:
@@ -437,7 +515,7 @@ def fcmd_wait(ctx: Ctx, args: str) -> str:
     time.sleep(min(delay, 30))
     return forum_capture(tid)
 
-# --- DM mode commands ---
+# --- DM commands ---
 
 def dcmd_new(ctx: Ctx, args: str) -> str:
     pid, name = dm_create(ctx.chat_id, args.strip() or None)
@@ -451,7 +529,7 @@ def dcmd_exec(ctx: Ctx, text: str) -> str:
         time.sleep(0.5)
     wez_send(pid, text + "\n")
     time.sleep(CAPTURE_DELAY)
-    return dm_capture(ctx.chat_id, pid)
+    return dm_capture(ctx.chat_id, pid, cmd_text=text)
 
 def dcmd_attach(ctx: Ctx, args: str) -> str:
     parts = args.strip().split(maxsplit=1)
@@ -563,7 +641,8 @@ def cmd_panes(_ctx: Ctx, _args: str) -> str:
         if cwd:
             cwd = cwd.replace("file://", "").split("/")[-2:]
             cwd = "/".join(cwd)
-        lines.append(f"  [{pid}] {title}  ({cwd})")
+        tracked = " [tracked]" if pid in pane_to_thread else ""
+        lines.append(f"  [{pid}] {title}  ({cwd}){tracked}")
     return "All WezTerm panes:\n" + "\n".join(lines)
 
 def cmd_keys(_ctx: Ctx, _args: str) -> str:
@@ -647,6 +726,12 @@ def main():
         print(f"Allowed users: {ALLOWED_USER_IDS}")
     else:
         print("WARNING: No ALLOWED_USER_IDS — anyone can use this bot!")
+
+    # Start pane monitor in background
+    if FORUM_GROUP_ID:
+        monitor = threading.Thread(target=pane_monitor, daemon=True)
+        monitor.start()
+
     print("Listening...")
 
     offset = None
