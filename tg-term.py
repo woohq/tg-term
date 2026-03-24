@@ -14,6 +14,7 @@ DM mode (fallback): Chat directly with the bot when no group is configured.
 import json as _json
 import os
 import platform
+import signal
 import subprocess
 import sys
 import threading
@@ -201,10 +202,12 @@ state_lock = threading.Lock()
 STATE_FILE = Path(__file__).parent / ".tg-term-state.json"
 
 def save_state():
-    """Persist pane<->topic mappings to disk."""
+    """Persist pane<->topic mappings to disk (atomic write)."""
     data = {str(pid): tid for pid, tid in pane_to_thread.items()}
     names = {str(tid): s["name"] for tid, s in forum_sessions.items()}
-    STATE_FILE.write_text(_json.dumps({"pane_to_thread": data, "names": names}))
+    tmp = STATE_FILE.with_suffix(".tmp")
+    tmp.write_text(_json.dumps({"pane_to_thread": data, "names": names}))
+    tmp.replace(STATE_FILE)  # atomic on POSIX
 
 def load_state():
     """Restore pane<->topic mappings from disk."""
@@ -835,7 +838,16 @@ def main():
                 ctx.reply(f"Error: {e}")
 
 if __name__ == "__main__":
+    def _shutdown(signum, frame):
+        print("\nSaving state...")
+        with state_lock:
+            save_state()
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _shutdown)
     try:
         main()
     except KeyboardInterrupt:
+        with state_lock:
+            save_state()
         print("\nStopped.")
