@@ -197,6 +197,29 @@ dm_state: dict[int, dict] = {}
 # Lock for thread-safe state access
 state_lock = threading.Lock()
 
+# Persistence file for pane<->topic mappings
+STATE_FILE = Path(__file__).parent / ".tg-term-state.json"
+
+def save_state():
+    """Persist pane<->topic mappings to disk."""
+    data = {str(pid): tid for pid, tid in pane_to_thread.items()}
+    names = {str(tid): s["name"] for tid, s in forum_sessions.items()}
+    STATE_FILE.write_text(_json.dumps({"pane_to_thread": data, "names": names}))
+
+def load_state():
+    """Restore pane<->topic mappings from disk."""
+    if not STATE_FILE.exists():
+        return
+    try:
+        data = _json.loads(STATE_FILE.read_text())
+        for pid_str, tid in data.get("pane_to_thread", {}).items():
+            pid = int(pid_str)
+            name = data.get("names", {}).get(str(tid), f"pane-{pid}")
+            forum_register(tid, pid, name)
+        print(f"  restored {len(pane_to_thread)} pane mappings from state file")
+    except Exception as e:
+        print(f"  failed to load state: {e}")
+
 # --- Forum helpers ---
 
 def forum_get_pane(thread_id: int) -> int | None:
@@ -216,6 +239,7 @@ def forum_unregister_pane(pane_id: int):
     if tid and tid in forum_sessions:
         del forum_sessions[tid]
         close_topic(tid)
+    save_state()
 
 def forum_create(name: str) -> tuple[int, int, str]:
     """Create topic + pane. Returns (thread_id, pane_id, name)."""
@@ -346,6 +370,7 @@ def pane_monitor():
                     tid = create_topic(topic_name)
                     if tid:
                         forum_register(tid, pid, base)
+                        save_state()
                         print(f"  monitor: pane {pid} -> '{topic_name}'")
 
                 # Closed panes — close topics
@@ -738,8 +763,17 @@ def main():
     else:
         print("WARNING: No ALLOWED_USER_IDS — anyone can use this bot!")
 
-    # Start pane monitor in background
+    # Restore state and clean up stale mappings
     if FORUM_GROUP_ID:
+        load_state()
+        # Remove mappings for panes that no longer exist
+        current_pids = {p["pane_id"] for p in wez_list_panes()}
+        stale = [pid for pid in list(pane_to_thread.keys()) if pid not in current_pids]
+        for pid in stale:
+            forum_unregister_pane(pid)
+        if stale:
+            print(f"  cleaned up {len(stale)} stale pane mappings")
+
         monitor = threading.Thread(target=pane_monitor, daemon=True)
         monitor.start()
 
